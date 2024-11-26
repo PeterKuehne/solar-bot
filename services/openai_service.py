@@ -10,7 +10,7 @@ class OpenAIService:
     def __init__(self, api_key: str):
         self.client = OpenAI(api_key=api_key)
         self.model = "gpt-4o-mini"
-        self.max_history_age = timedelta(minutes=10)
+        self.max_history_age = timedelta(minutes=5)
         self.max_history_length = 10
         self.conversations: Dict[str, Dict[str, Any]] = {}
         
