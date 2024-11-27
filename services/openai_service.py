@@ -16,45 +16,67 @@ class OpenAIService:
         
         self.tools = [
             {
-                "type": "function",
-                "function": {
-                    "name": "calculate_solar_savings",
-                    "description": "Berechnet die potentiellen Einsparungen durch eine Solaranlage",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "address": {
-                                "type": "string",
-                                "description": "Vollständige Adresse des Gebäudes"
-                            },
-                            "monthly_bill": {
-                                "type": "number",
-                                "description": "Monatliche Stromkosten in Euro"
-                            }
+                "name": "calculate_solar_savings",
+                "description": "Berechnet die potentiellen Einsparungen durch eine Solaranlage",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "address": {
+                            "type": "string",
+                            "description": "Vollständige Adresse des Gebäudes"
                         },
-                        "required": ["address", "monthly_bill"]
-                    }
+                        "monthly_bill": {
+                            "type": "number",
+                            "description": "Monatliche Stromkosten in Euro"
+                        }
+                    },
+                    "required": ["address", "monthly_bill"]
                 }
             },
             {
-                "type": "function",
-                "function": {
-                    "name": "create_appointment",
-                    "description": "Erstellt einen Beratungstermin (Zeiten in deutscher Zeit / UTC+1)",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "start_time": {
-                                "type": "string",
-                                "description": "Startzeit im ISO-Format mit Zeitzone +01:00 (z.B. 2024-11-27T10:00:00+01:00)"
-                            },
-                            "email": {
-                                "type": "string",
-                                "description": "E-Mail-Adresse des Kunden"
-                            }
+                "name": "create_event",
+                "description": "Erstellt einen neuen Beratungstermin.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "start_time": {
+                            "type": "string",
+                            "description": "Startzeit im ISO-Format mit Zeitzone +01:00 (z.B. 2024-11-27T10:00:00+01:00)"
                         },
-                        "required": ["start_time", "email"]
-                    }
+                        "email": {
+                            "type": "string",
+                            "description": "E-Mail-Adresse des Kunden"
+                        }
+                    },
+                    "required": ["start_time", "email"]
+                }
+            },
+            {
+                "name": "check_availability",
+                "description": "Prüft, ob ein bestimmter Termin verfügbar ist.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "date_time": {
+                            "type": "string",
+                            "description": "ISO 8601 Datumszeit"
+                        }
+                    },
+                    "required": ["date_time"]
+                }
+            },
+            {
+                "name": "suggest_alternative",
+                "description": "Schlägt eine alternative Zeit vor, wenn ein Termin nicht verfügbar ist.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "date_time": {
+                            "type": "string",
+                            "description": "ISO 8601 Datumszeit"
+                        }
+                    },
+                    "required": ["date_time"]
                 }
             }
         ]
@@ -122,60 +144,49 @@ class OpenAIService:
             # Get conversation history and update it
             messages = self._get_conversation(user_id)
             
+            logger.info(f"Tools being sent to OpenAI API: {json.dumps(self.tools, indent=2)}")
+            
             # Add new messages to history
             messages.extend(conversation_history[-2:] if len(conversation_history) > 2 else conversation_history)
 
+            # Make the API call
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                tools=self.tools,
-                tool_choice="auto"
+                functions=self.tools  # Correctly pass the tools/functions
             )
 
+            # Inspect the response for debugging
+            logger.info(f"OpenAI API response: {response}")
+
+            # Extract the assistant message
             assistant_message = response.choices[0].message
 
-            if hasattr(assistant_message, 'tool_calls') and assistant_message.tool_calls:
-                tool_call = assistant_message.tool_calls[0]
-                function_name = tool_call.function.name
-                arguments = json.loads(tool_call.function.arguments)
+            # Handle function calls
+            if isinstance(assistant_message, dict) and "function_call" in assistant_message:
+                tool_call = assistant_message["function_call"]
+                function_name = tool_call.get("name")
+                arguments = json.loads(tool_call.get("arguments", "{}"))
 
                 return {
                     "type": "function_call",
                     "function": function_name,
                     "arguments": arguments
                 }
-            else:
+            elif "content" in assistant_message:
+                # Standard message response
                 return {
                     "type": "message",
-                    "content": assistant_message.content
+                    "content": assistant_message["content"]
+                }
+            else:
+                # Unexpected response format
+                logger.error(f"Unexpected API response format: {assistant_message}")
+                return {
+                    "type": "error",
+                    "message": "Ein unerwartetes Problem ist aufgetreten. Bitte versuchen Sie es erneut."
                 }
 
         except Exception as e:
             logger.error(f"Error in process_message: {str(e)}")
-            raise
-
-    async def format_response(self, result: Dict[str, Any], conversation_history: List[Dict[str, str]], user_id: str = "default") -> str:
-        """Format the response from function calls"""
-        try:
-            messages = self._get_conversation(user_id)
-            messages.append({
-                "role": "user",
-                "content": f"Formatiere dieses Ergebnis: {json.dumps(result)}"
-            })
-
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages
-            )
-
-            formatted_response = response.choices[0].message.content
-            messages.append({
-                "role": "assistant",
-                "content": formatted_response
-            })
-
-            return formatted_response
-
-        except Exception as e:
-            logger.error(f"Error in format_response: {str(e)}")
             raise

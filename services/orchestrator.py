@@ -18,6 +18,11 @@ class Orchestrator:
         self.openai_service = openai_service
         self.solar_calculator = solar_calculator
         self.calendar_service = calendar_service
+        self.registered_functions = {
+            "check_availability": self.calendar_service.check_availability,
+            "create_event": self.calendar_service.create_event,
+            "suggest_alternative": self.calendar_service.suggest_alternative,
+        }
         self.conversations: Dict[str, List[Dict[str, str]]] = {}
         self.timezone = pytz.timezone('Europe/Berlin')
 
@@ -40,38 +45,38 @@ class Orchestrator:
             response = await self.openai_service.process_message(conversation_history)
 
             # Handle function calls
-            if response.get("type") == "function_call":
-                function_result = await self._handle_function_call(
-                    response["function"],
-                    response["arguments"],
-                    user_email
-                )
-                
-                # Format the response
-                formatted_response = await self.openai_service.format_response(
-                    function_result,
-                    conversation_history
-                )
-                
-                # Add assistant response to conversation history
-                conversation_history.append({
-                    "role": "assistant",
-                    "content": formatted_response
-                })
-                
-                return formatted_response
+            message = response["choices"][0]["message"]
+
+            # Prüfen, ob ein function_call vorhanden ist
+            if "function_call" in message:
+                function_call = message["function_call"]
+                function_name = function_call["name"]
+                arguments = json.loads(function_call["arguments"])
+
+                logger.info(f"Function call detected: {function_name} with arguments {arguments}")
+
+                return {
+                    "type": "function_call",
+                    "function": function_name,
+                    "arguments": arguments
+                }
+            elif "content" in message and message["content"] is not None:
+                # Normale Textantwort
+                return {
+                    "type": "message",
+                    "content": message["content"]
+                }
             else:
-                # Add direct response to conversation history
-                conversation_history.append({
-                    "role": "assistant",
-                    "content": response["content"]
-                })
-                
-                return response["content"]
+                # Unerwartetes Format
+                logger.error(f"Unexpected API response format: {message}")
+                return {
+                    "type": "error",
+                    "message": "Ein unerwartetes Problem ist aufgetreten. Bitte versuchen Sie es erneut."
+                }
 
         except Exception as e:
-            logger.error(f"Error in process_message: {str(e)}")
-            raise
+            logger.error(f"Error in process_message: {str(e)}", exc_info=True)
+            return "Ein Systemfehler ist aufgetreten. Bitte versuchen Sie es später erneut."
 
     async def _handle_function_call(
         self,

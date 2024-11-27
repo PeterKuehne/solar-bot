@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 import pytz
 import asyncio
@@ -23,7 +23,7 @@ class CalendarService:
             logger.error(f"Failed to initialize Calendar Service: {str(e)}")
             raise
 
-    async def get_available_slots(self, start_time: datetime) -> Dict[str, Any]:
+    async def check_availability(self, start_time: datetime) -> Dict[str, Any]:
         """Check if a time slot is available"""
         logger.debug(f"Checking availability for time slot: {start_time}")
         try:
@@ -73,7 +73,7 @@ class CalendarService:
             logger.error(f"Error checking availability: {str(e)}")
             raise
 
-    async def book_appointment(
+    async def create_event(
         self,
         date: str,
         email: str,
@@ -168,3 +168,15 @@ Agenda:
                 "error": "booking_failed",
                 "message": f"Fehler bei der Terminbuchung: {str(e)}"
             }
+    async def suggest_alternative(self, date_time: datetime) -> Optional[datetime]:
+        """Suggest the next available time slot asynchronously."""
+        try:
+            current_time = date_time
+            while True:
+                availability = await self.get_available_slots(current_time)
+                if availability["available"]:
+                    return current_time
+                current_time += timedelta(hours=1)  # Increment by 1 hour
+        except Exception as e:
+            logger.error(f"Error suggesting alternative time: {str(e)}")
+            return None
