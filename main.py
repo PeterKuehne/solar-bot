@@ -1,12 +1,13 @@
 import os
 import logging
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import asyncio
+from fastapi import FastAPI, HTTPException, BackgroundTasks, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import Optional
-from pydantic import BaseModel
-import uvicorn
-import asyncio
+from pydantic import BaseModel, EmailStr, validator
+from datetime import datetime
+import re
 from config import Settings
 from services.orchestrator import Orchestrator
 from services.openai_service import OpenAIService
@@ -14,9 +15,8 @@ from services.solar_calculator import SolarCalculator
 from services.calendar_service import CalendarService
 from logging_config import setup_logging
 
-# Konstanten für Timeout-Handling
+# Konstanten
 TIMEOUT_SECONDS = 25  # Unter Herokus 30-Sekunden-Limit
-MAX_RETRIES = 2
 
 # Setup logging
 setup_logging()
@@ -37,33 +37,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Timeout middleware
-@app.middleware("http")
-async def timeout_middleware(request, call_next):
-    try:
-        return await asyncio.wait_for(
-            call_next(request),
-            timeout=TIMEOUT_SECONDS
-        )
-    except asyncio.TimeoutError:
-        logger.error("Global timeout in middleware")
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": "timeout",
-                "detail": "Server timeout. Bitte versuchen Sie es erneut."
-            }
-        )
-    except Exception as e:
-        logger.error(f"Middleware error: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": "internal_error",
-                "detail": str(e)
-            }
-        )
 
 # Load settings with error handling
 try:
@@ -93,6 +66,37 @@ class ChatRequest(BaseModel):
     message: str
     user_email: Optional[str] = None
 
+    @validator('message')
+    def validate_message(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Nachricht darf nicht leer sein")
+        return v.strip()
+
+    @validator('user_email')
+    def validate_email(cls, v):
+        if v is None:
+            return v
+        # Einfache E-Mail-Validierung
+        if v and not re.match(r"[^@]+@[^@]+\.[^@]+", v):
+            raise ValueError("Ungültige E-Mail-Adresse")
+        return v
+
+@app.exception_handler(422)
+async def validation_exception_handler(request, exc):
+    error_messages = []
+    for error in exc.errors():
+        field = error["loc"][-1]
+        msg = error["msg"]
+        error_messages.append(f"{field}: {msg}")
+    
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": "Validierungsfehler",
+            "errors": error_messages
+        },
+    )
+
 @app.get("/")
 async def root():
     return {
@@ -107,53 +111,45 @@ async def health_check():
 
 @app.post("/chat")
 async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
-    logger.info(f"Received chat request with email: {str(request.user_email)}")  # Korrigiert
-    retries = 0
-    while retries <= MAX_RETRIES:
-        try:
-            response = await asyncio.wait_for(
-                orchestrator.process_message(
-                    message=request.message,
-                    user_email=request.user_email if request.user_email else None  # Korrigiert
-                ),
-                timeout=TIMEOUT_SECONDS
-            )
-            return JSONResponse(content={"response": response})
-            
-        except asyncio.TimeoutError:
-            retries += 1
-            if retries <= MAX_RETRIES:
-                logger.warning(f"Timeout occurred, retrying ({retries}/{MAX_RETRIES})")
-                await asyncio.sleep(1)
-                continue
-            else:
-                logger.error("Final timeout after retries")
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": "timeout",
-                        "detail": "Die Anfrage hat zu lange gedauert. Bitte versuchen Sie es in ein paar Minuten erneut."
-                    }
-                )
-                
-        except Exception as e:
-            logger.error(f"Error in chat endpoint: {str(e)}")
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "error": "internal_error",
-                    "detail": str(e)
-                }
-            )
+    try:
+        logger.info(f"Received chat request with message: {request.message[:50]}...")
+        if request.user_email:
+            logger.info(f"User email provided: {request.user_email}")
+
+        response = await asyncio.wait_for(
+            orchestrator.process_message(
+                message=request.message,
+                user_email=request.user_email
+            ),
+            timeout=TIMEOUT_SECONDS
+        )
+        return JSONResponse(content={"response": response})
+        
+    except asyncio.TimeoutError:
+        logger.error("Request timeout")
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": "timeout",
+                "detail": "Die Anfrage hat zu lange gedauert. Bitte versuchen Sie es in ein paar Minuten erneut."
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error in chat endpoint: {str(e)}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "error": "internal_error",
+                "detail": str(e)
+            }
+        )
 
 if __name__ == "__main__":
-    # Heroku setzt den PORT als Umgebungsvariable
+    import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    
-    # Wichtig: host muss "0.0.0.0" sein für Heroku
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=port,
-        workers=1  
+        workers=1
     )
