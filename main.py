@@ -38,6 +38,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def log_requests(request, call_next):
+    # Log the incoming request
+    logger.info(f"Request: {request.method} {request.url}")
+    try:
+        body = await request.body()
+        if body:
+            logger.debug(f"Request body: {body.decode()}")
+    except Exception:
+        pass
+
+    try:
+        response = await call_next(request)
+        
+        # Log the response
+        logger.info(f"Response status: {response.status_code}")
+        
+        return response
+    except Exception as e:
+        logger.error(f"Request processing error: {str(e)}")
+        raise
+
 # Load settings with error handling
 try:
     settings = Settings()
@@ -89,6 +111,15 @@ async def validation_exception_handler(request, exc):
         msg = error["msg"]
         error_messages.append(f"{field}: {msg}")
     
+    # Log the full error details
+    logger.error(f"Validation error: {error_messages}")
+    try:
+        body = await request.body()
+        if body:
+            logger.error(f"Request body that caused validation error: {body.decode()}")
+    except Exception as e:
+        logger.error(f"Could not log request body: {str(e)}")
+    
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
@@ -112,6 +143,8 @@ async def health_check():
 @app.post("/chat")
 async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     try:
+        # Log the raw request for debugging
+        logger.debug(f"Raw request data: {request.dict()}")
         logger.info(f"Received chat request with message: {request.message[:50]}...")
         if request.user_email:
             logger.info(f"User email provided: {request.user_email}")
