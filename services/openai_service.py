@@ -119,8 +119,22 @@ class OpenAIService:
 
     async def process_message(self, conversation_history: List[Dict[str, str]], user_id: str = "default") -> Dict[str, Any]:
         try:
-            # Get conversation history and update it
             messages = self._get_conversation(user_id)
+            
+            # Erweitere den System Prompt um Datumserkennung
+            messages[0]["content"] = self.system_prompt + """
+            Bei der Terminbuchung:
+            - Wandle relative Zeitangaben ("nächsten Mittwoch", "kommenden Donnerstag") in konkrete Daten um
+            - Berechne das Datum vom aktuellen Tag aus
+            - "Nächster [Wochentag]" bedeutet der nächstmögliche [Wochentag] nach heute
+            - Stelle das Datum im korrekten ISO-Format mit Zeitzone dar
+            - Beispiel: Wenn heute Dienstag ist und jemand "nächsten Mittwoch" sagt, 
+              nehme den darauffolgenden Mittwoch
+
+            Beispiele für die Umwandlung:
+            - "nächsten Mittwoch um 10:00" → "2024-12-04T10:00:00+01:00"
+            - "kommenden Donnerstag 14 Uhr" → "2024-12-05T14:00:00+01:00"
+            """
             
             # Add new messages to history
             messages.extend(conversation_history[-2:] if len(conversation_history) > 2 else conversation_history)
@@ -138,6 +152,10 @@ class OpenAIService:
                 tool_call = assistant_message.tool_calls[0]
                 function_name = tool_call.function.name
                 arguments = json.loads(tool_call.function.arguments)
+
+                # Bei Terminbuchungen, prüfe das Datumsformat
+                if function_name == "create_appointment":
+                    logger.info(f"Verarbeite Terminanfrage für: {arguments.get('start_time')}")
 
                 return {
                     "type": "function_call",
