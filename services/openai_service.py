@@ -154,60 +154,60 @@ class OpenAIService:
             logger.error(f"Error in process_message: {str(e)}")
             raise
 
-   async def format_response(self, result: Dict[str, Any], conversation_history: List[Dict[str, str]], user_id: str = "default") -> str:
-    """Format the response from function calls"""
-    try:
-        messages = self._get_conversation(user_id)
-        
-        # Benutzerfreundliche Fehlerbehandlung
-        if "error" in result:
-            error_prompts = {
-                "slot_not_available": """
-                Formatiere diese Nachricht benutzerfreundlich:
-                Der gewünschte Termin ist leider schon vergeben. Bitte frage den Kunden nach einem alternativen Terminwunsch.
-                """,
-                "invalid_date": """
-                Formatiere diese Nachricht benutzerfreundlich:
-                Der Termin liegt außerhalb unserer Geschäftszeiten (Mo-Fr, 9-17 Uhr). Bitte frage nach einem alternativen Terminwunsch.
-                """,
-                "calendar_api_error": """
-                Formatiere diese Nachricht benutzerfreundlich:
-                Es gibt technische Probleme mit der Terminbuchung. Bitte den Kunden, es in einigen Minuten erneut zu versuchen.
-                """,
-                "booking_failed": """
-                Formatiere diese Nachricht benutzerfreundlich:
-                Die Terminbuchung konnte nicht abgeschlossen werden. Bitte frage nach einem alternativen Terminwunsch.
-                """
-            }
+    async def format_response(self, result: Dict[str, Any], conversation_history: List[Dict[str, str]], user_id: str = "default") -> str:
+        """Format the response from function calls"""
+        try:
+            messages = self._get_conversation(user_id)
             
-            error_prompt = error_prompts.get(
-                result["error"],
-                f"Formatiere diese Fehlermeldung benutzerfreundlich: {result['message']}"
+            # Benutzerfreundliche Fehlerbehandlung
+            if "error" in result:
+                error_prompts = {
+                    "slot_not_available": """
+                    Formatiere diese Nachricht benutzerfreundlich:
+                    Der gewünschte Termin ist leider schon vergeben. Bitte frage den Kunden nach einem alternativen Terminwunsch.
+                    """,
+                    "invalid_date": """
+                    Formatiere diese Nachricht benutzerfreundlich:
+                    Der Termin liegt außerhalb unserer Geschäftszeiten (Mo-Fr, 9-17 Uhr). Bitte frage nach einem alternativen Terminwunsch.
+                    """,
+                    "calendar_api_error": """
+                    Formatiere diese Nachricht benutzerfreundlich:
+                    Es gibt technische Probleme mit der Terminbuchung. Bitte den Kunden, es in einigen Minuten erneut zu versuchen.
+                    """,
+                    "booking_failed": """
+                    Formatiere diese Nachricht benutzerfreundlich:
+                    Die Terminbuchung konnte nicht abgeschlossen werden. Bitte frage nach einem alternativen Terminwunsch.
+                    """
+                }
+                
+                error_prompt = error_prompts.get(
+                    result["error"],
+                    f"Formatiere diese Fehlermeldung benutzerfreundlich: {result['message']}"
+                )
+                
+                messages.append({
+                    "role": "user",
+                    "content": error_prompt
+                })
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": f"Formatiere dieses Ergebnis benutzerfreundlich: {json.dumps(result)}"
+                })
+
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages
             )
-            
+
+            formatted_response = response.choices[0].message.content
             messages.append({
-                "role": "user",
-                "content": error_prompt
-            })
-        else:
-            messages.append({
-                "role": "user",
-                "content": f"Formatiere dieses Ergebnis benutzerfreundlich: {json.dumps(result)}"
+                "role": "assistant",
+                "content": formatted_response
             })
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages
-        )
+            return formatted_response
 
-        formatted_response = response.choices[0].message.content
-        messages.append({
-            "role": "assistant",
-            "content": formatted_response
-        })
-
-        return formatted_response
-
-    except Exception as e:
-        logger.error(f"Error in format_response: {str(e)}")
-        return "Entschuldigung, es gab ein Problem bei der Verarbeitung. Wie kann ich Ihnen anders weiterhelfen?"
+        except Exception as e:
+            logger.error(f"Error in format_response: {str(e)}")
+            return "Entschuldigung, es gab ein Problem bei der Verarbeitung. Wie kann ich Ihnen anders weiterhelfen?"
