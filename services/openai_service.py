@@ -42,7 +42,7 @@ class OpenAIService:
         """Verarbeitet eine einzelne Anfrage"""
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-4o-mini",
                 messages=[{
                     "role": "system",
                     "content": """Du bist ein Experte für Solaranlagen und hilfst dabei, 
