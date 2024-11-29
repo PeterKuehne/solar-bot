@@ -15,13 +15,13 @@ class OpenAIService:
             # Nicht-asynchroner Aufruf, da die neue OpenAI API kein async unterstützt
             if functions:
                 response = self.client.chat.completions.create(
-                    model="gpt-4",
+                    model="gpt-4o-mini",
                     messages=messages,
                     functions=functions
                 )
             else:
                 response = self.client.chat.completions.create(
-                    model="gpt-4",
+                    model="gpt-4o-mini",
                     messages=messages
                 )
             
