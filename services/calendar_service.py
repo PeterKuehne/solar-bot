@@ -73,6 +73,34 @@ class CalendarService:
             logger.error(f"Error checking availability: {str(e)}")
             raise
 
+    async def create_appointment(self,
+                               datetime: datetime,
+                               email: str,
+                               name: str,
+                               phone: Optional[str] = None,
+                               notes: Optional[str] = None,
+                               duration: int = 60) -> Dict[str, Any]:
+        """Create a new appointment"""
+        description = f"""
+Solar-Beratungstermin
+
+Kunde: {name}
+Tel: {phone if phone else 'Nicht angegeben'}
+Notizen: {notes if notes else 'Keine'}
+
+Agenda:
+- Analyse des Stromverbrauchs
+- Berechnung des Solarpotentials
+- Wirtschaftlichkeitsberechnung
+- Fördermöglichkeiten
+- Nächste Schritte
+"""
+        return await self.create_event(
+            date=datetime.isoformat(),
+            email=email,
+            description=description
+        )
+
     async def create_event(
         self,
         date: str,
@@ -88,7 +116,7 @@ class CalendarService:
             logger.debug(f"Attempting to book appointment for {email} at {start_time}")
 
             # Check availability
-            availability = await self.get_available_slots(start_time)
+            availability = await self.check_availability(start_time)
             if not availability.get("available"):
                 logger.warning(f"Slot not available: {availability.get('message')}")
                 return availability
@@ -116,7 +144,7 @@ Agenda:
                     'timeZone': 'Europe/Berlin',
                 },
                 'attendees': [
-                    {'email': email}  # Verwende die übergebene E-Mail statt der hartcodierten
+                    {'email': email}
                 ],
                 'reminders': {
                     'useDefault': False,
@@ -168,12 +196,13 @@ Agenda:
                 "error": "booking_failed",
                 "message": f"Fehler bei der Terminbuchung: {str(e)}"
             }
+
     async def suggest_alternative(self, date_time: datetime) -> Optional[datetime]:
         """Suggest the next available time slot asynchronously."""
         try:
             current_time = date_time
             while True:
-                availability = await self.get_available_slots(current_time)
+                availability = await self.check_availability(current_time)
                 if availability["available"]:
                     return current_time
                 current_time += timedelta(hours=1)  # Increment by 1 hour

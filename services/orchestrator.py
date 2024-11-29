@@ -1,160 +1,167 @@
 from typing import Dict, Any, List, Optional
-from datetime import datetime
-import pytz
 import logging
-from .openai_service import OpenAIService
-from .solar_calculator import SolarCalculator
-from .calendar_service import CalendarService
+import json
+import pytz
+from datetime import datetime
+from .agents.solar_agent import SolarAgent
+from .agents.calendar_agent import CalendarAgent
 
 logger = logging.getLogger(__name__)
 
 class Orchestrator:
-    def __init__(
-        self,
-        openai_service: OpenAIService,
-        solar_calculator: SolarCalculator,
-        calendar_service: CalendarService
-    ):
-        self.openai_service = openai_service
-        self.solar_calculator = solar_calculator
-        self.calendar_service = calendar_service
-        self.registered_functions = {
-            "check_availability": self.calendar_service.check_availability,
-            "create_event": self.calendar_service.create_event,
-            "suggest_alternative": self.calendar_service.suggest_alternative,
-        }
-        self.conversations: Dict[str, List[Dict[str, str]]] = {}
+    """
+    Koordiniert die Kommunikation zwischen den spezialisierten Agenten.
+    Verwaltet Handoffs und Kontextübergaben zwischen den Agenten.
+    """
+    
+    def __init__(self, openai_service, solar_calculator, calendar_service):
         self.timezone = pytz.timezone('Europe/Berlin')
+        
+        # Initialisiere die spezialisierten Agenten
+        self.agents = {
+            "solar_agent": SolarAgent(openai_service, solar_calculator),
+            "calendar_agent": CalendarAgent(openai_service, calendar_service)
+        }
+        
+        # Speichert Konversationshistorien
+        self.conversations: Dict[str, List[Dict[str, str]]] = {}
+        
+        # Tracking für Handoffs
+        self.current_agent: Dict[str, str] = {}
+        self.handoff_history: Dict[str, List[Dict[str, Any]]] = {}
+        
+        # Maximale Anzahl von Handoffs pro Konversation
+        self.max_handoffs = 5
 
     def _get_conversation_history(self, user_id: str = "default") -> List[Dict[str, str]]:
-        """Get or create conversation history for user"""
+        """Holt oder erstellt eine neue Konversationshistorie"""
         if user_id not in self.conversations:
             self.conversations[user_id] = []
         return self.conversations[user_id]
 
-    async def process_message(self, message: str, user_email: Optional[str] = None, user_id: str = "default") -> str:
-        """Process a message and return the response"""
+    def _get_current_agent(self, user_id: str = "default") -> str:
+        """Ermittelt den aktuell zuständigen Agenten"""
+        return self.current_agent.get(user_id, "solar_agent")
+
+    def _record_handoff(self, user_id: str, from_agent: str, to_agent: str, reason: str):
+        """Dokumentiert einen Handoff zwischen Agenten"""
+        if user_id not in self.handoff_history:
+            self.handoff_history[user_id] = []
+        
+        self.handoff_history[user_id].append({
+            "timestamp": datetime.now(self.timezone).isoformat(),
+            "from_agent": from_agent,
+            "to_agent": to_agent,
+            "reason": reason
+        })
+
+    async def process_message(self, message: str, context: Optional[Dict] = None, 
+                            user_id: str = "default") -> Dict[str, Any]:
+        """
+        Verarbeitet eine Nachricht und koordiniert mögliche Handoffs zwischen Agenten.
+        
+        Args:
+            message: Die Nutzernachricht
+            context: Optionaler Kontext für die Verarbeitung
+            user_id: Identifier für den Nutzer
+            
+        Returns:
+            Dict mit der Antwort und möglichen Handoff-Informationen
+        """
         try:
-            # Get conversation history for this user
+            # Hole oder erstelle Konversationshistorie
             conversation_history = self._get_conversation_history(user_id)
             
-            # Add user message to conversation history
-            conversation_history.append({"role": "user", "content": message})
-
-            # Get response from OpenAI
-            response = await self.openai_service.process_message(conversation_history)
-
-            # Handle function calls
-            message = response["choices"][0]["message"]
-
-            # Prüfen, ob ein function_call vorhanden ist
-            if "function_call" in message:
-                function_call = message["function_call"]
-                function_name = function_call["name"]
-                arguments = json.loads(function_call["arguments"])
-
-                logger.info(f"Function call detected: {function_name} with arguments {arguments}")
-
-                return {
-                    "type": "function_call",
-                    "function": function_name,
-                    "arguments": arguments
-                }
-            elif "content" in message and message["content"] is not None:
-                # Normale Textantwort
-                return {
-                    "type": "message",
-                    "content": message["content"]
-                }
-            else:
-                # Unerwartetes Format
-                logger.error(f"Unexpected API response format: {message}")
-                return {
-                    "type": "error",
-                    "message": "Ein unerwartetes Problem ist aufgetreten. Bitte versuchen Sie es erneut."
-                }
-
-        except Exception as e:
-            logger.error(f"Error in process_message: {str(e)}", exc_info=True)
-            return "Ein Systemfehler ist aufgetreten. Bitte versuchen Sie es später erneut."
-
-    async def _handle_function_call(
-        self,
-        function_name: str,
-        arguments: Dict[str, Any],
-        user_email: Optional[str]
-    ) -> Dict[str, Any]:
-        logger.info(f"Handling function call: {function_name} with arguments: {arguments}")
-        try:
-            if function_name == "calculate_solar_savings":
-                try:
-                    coordinates = await self.solar_calculator.get_coordinates(
-                        arguments["address"]
-                    )
-                    result = await self.solar_calculator.calculate_savings(
-                        float(arguments["monthly_bill"]) * 12,  # Convert to yearly consumption
-                        coordinates
-                    )
-                    logger.info(f"Solar calculation result: {result}")
-                    return result
-                except Exception as e:
-                    logger.error(f"Error in solar calculation: {str(e)}")
+            # Füge Nutzernachricht zur Historie hinzu
+            conversation_history.append({
+                "role": "user",
+                "content": message
+            })
+            
+            # Hole aktuellen Agenten
+            current_agent_id = self._get_current_agent(user_id)
+            current_agent = self.agents[current_agent_id]
+            
+            # Verarbeite die Nachricht mit dem aktuellen Agenten
+            response = await current_agent.process(
+                message=message,
+                conversation_history=conversation_history
+            )
+            
+            # Prüfe auf Handoff-Anfrage
+            if response["type"] == "handoff":
+                # Prüfe maximale Handoff-Anzahl
+                if len(self.handoff_history.get(user_id, [])) >= self.max_handoffs:
+                    logger.warning(f"Maximale Handoff-Anzahl erreicht für User {user_id}")
                     return {
-                        "error": "calculation_failed",
-                        "message": f"Fehler bei der Berechnung: {str(e)}"
+                        "type": "error",
+                        "content": "Zu viele Agentenübergaben. Bitte starten Sie eine neue Anfrage."
                     }
-
-            elif function_name == "create_appointment":
-                try:
-                    start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
-                    start_time = start_time.astimezone(self.timezone)
-                except ValueError:
-                    return {
-                        "error": "invalid_date",
-                        "message": "Ungültiges Datumsformat. Bitte geben Sie ein vollständiges Datum an."
-                    }
-
-                # First check availability
-                availability = await self.calendar_service.get_available_slots(start_time)
-                logger.info(f"Availability check: {availability}")
                 
-                if not availability.get("available"):
+                # Führe Handoff durch
+                new_agent_id = response["target_agent"]
+                if new_agent_id not in self.agents:
+                    logger.error(f"Unbekannter Zielagent: {new_agent_id}")
                     return {
-                        "error": "slot_not_available",
-                        "message": availability.get("message", "Dieser Termin ist nicht verfügbar.")
+                        "type": "error",
+                        "content": "Interner Fehler bei der Agentenübergabe."
                     }
-
-                # If available, try to book with email from arguments
-                result = await self.calendar_service.book_appointment(
-                    date=start_time.isoformat(),
-                    email=arguments["email"]  # Email kommt direkt aus den arguments
+                
+                # Dokumentiere Handoff
+                self._record_handoff(
+                    user_id=user_id,
+                    from_agent=current_agent_id,
+                    to_agent=new_agent_id,
+                    reason=response.get("reason", "Nicht spezifiziert")
                 )
-
-                logger.info(f"Booking result: {result}")
-                return result
-
-            elif function_name == "check_availability":
-                try:
-                    start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
-                    start_time = start_time.astimezone(self.timezone)
-                except ValueError:
-                    return {
-                        "error": "invalid_date",
-                        "message": "Ungültiges Datumsformat. Bitte geben Sie ein vollständiges Datum an."
-                    }
-
-                # Check availability using the calendar service
-                availability = await self.calendar_service.get_available_slots(start_time)
-                logger.info(f"Availability check result: {availability}")
-                return availability
-
-            else:
-                logger.warning(f"Unknown function called: {function_name}")
-                raise ValueError(f"Unknown function: {function_name}")
+                
+                # Aktualisiere aktuellen Agenten
+                self.current_agent[user_id] = new_agent_id
+                
+                # Füge Handoff-Information zur Konversationshistorie hinzu
+                conversation_history.append({
+                    "role": "system",
+                    "content": f"Übergabe an {new_agent_id} wegen: {response.get('reason')}"
+                })
+                
+                # Verarbeite mit neuem Agenten
+                return await self.agents[new_agent_id].process(
+                    message=message,
+                    conversation_history=conversation_history
+                )
+            
+            # Normale Antwort
+            conversation_history.append({
+                "role": "assistant",
+                "content": response.get("content", ""),
+                "agent": current_agent_id
+            })
+            
+            return {
+                "type": response["type"],
+                "content": response.get("content", ""),
+                "agent": current_agent_id,
+                "context": context
+            }
 
         except Exception as e:
-            logger.error(f"Error in _handle_function_call: {str(e)}", exc_info=True)
+            logger.error(f"Fehler in process_message: {str(e)}", exc_info=True)
             return {
-                "error": "system_error",
-                "message": f"Ein Systemfehler ist aufgetreten: {str(e)}"
+                "type": "error",
+                "content": f"Ein Fehler ist aufgetreten: {str(e)}"
             }
+
+    def get_conversation_summary(self, user_id: str = "default") -> Dict[str, Any]:
+        """Erstellt eine Zusammenfassung der Konversation mit Handoff-Historie"""
+        return {
+            "conversation_length": len(self.conversations.get(user_id, [])),
+            "current_agent": self._get_current_agent(user_id),
+            "handoff_count": len(self.handoff_history.get(user_id, [])),
+            "handoff_history": self.handoff_history.get(user_id, [])
+        }
+
+    def reset_conversation(self, user_id: str = "default"):
+        """Setzt die Konversation zurück"""
+        self.conversations[user_id] = []
+        self.current_agent[user_id] = "solar_agent"
+        self.handoff_history[user_id] = []

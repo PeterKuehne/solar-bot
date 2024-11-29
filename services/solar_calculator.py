@@ -14,7 +14,6 @@ class SolarCalculator:
         self.ssl_context = ssl.create_default_context(cafile=certifi.where())
 
     async def get_coordinates(self, address: str) -> Dict[str, float]:
-        """Get coordinates from address using Google Geocoding API"""
         try:
             url = f"https://maps.googleapis.com/maps/api/geocode/json?address={address}&key={self.google_api_key}"
             response = requests.get(url, verify=True)
@@ -28,13 +27,23 @@ class SolarCalculator:
             logger.error(f"Error getting coordinates: {str(e)}")
             raise
 
-    async def calculate_savings(self, consumption: float, location: Dict[str, float]) -> Dict[str, Any]:
+    async def calculate_savings(self, 
+                              consumption: float, 
+                              location: Dict[str, float],
+                              roof_angle: float = 35,
+                              orientation: str = 'south') -> Dict[str, Any]:
         try:
             # Calculate system size based on consumption
             system_size = self._calculate_system_size(consumption)
             
-            # Get solar production data from PVGIS
-            solar_data = await self._get_pvgis_data(location['lat'], location['lon'], system_size)
+            # Get solar production data from PVGIS with orientation parameters
+            solar_data = await self._get_pvgis_data(
+                location['lat'], 
+                location['lon'], 
+                system_size,
+                roof_angle,
+                self._convert_orientation(orientation)
+            )
             
             # Calculate savings
             savings = self._calculate_financial_savings(solar_data['yearly_production'], consumption)
@@ -52,10 +61,28 @@ class SolarCalculator:
 
     def _calculate_system_size(self, consumption: float) -> float:
         """Calculate recommended system size in kWp based on yearly consumption"""
-        # Rough estimation: 1 kWp produces ~1000 kWh/year in Germany
         return round(consumption / 1000, 2)
 
-    async def _get_pvgis_data(self, lat: float, lon: float, peak_power: float) -> Dict[str, Any]:
+    def _convert_orientation(self, orientation: str) -> int:
+        """Convert orientation string to PVGIS aspect angle"""
+        orientation_map = {
+            'south': 0,
+            'southeast': -45,
+            'southwest': 45,
+            'east': -90,
+            'west': 90,
+            'northeast': -135,
+            'northwest': 135,
+            'north': 180
+        }
+        return orientation_map.get(orientation.lower(), 0)
+
+    async def _get_pvgis_data(self, 
+                             lat: float, 
+                             lon: float, 
+                             peak_power: float,
+                             angle: float = 35,
+                             aspect: int = 0) -> Dict[str, Any]:
         try:
             params = {
                 'lat': str(lat),
@@ -63,8 +90,8 @@ class SolarCalculator:
                 'peakpower': str(peak_power),
                 'loss': '14',
                 'outputformat': 'json',
-                'angle': '35',
-                'aspect': '0'
+                'angle': str(angle),
+                'aspect': str(aspect)
             }
 
             async with aiohttp.ClientSession() as session:
@@ -79,7 +106,6 @@ class SolarCalculator:
                             }
                         except Exception as e:
                             logger.error(f"Error parsing PVGIS response: {str(e)}")
-                            # Fallback calculation if API fails
                             return self._calculate_fallback_production(peak_power)
                     else:
                         logger.error(f"PVGIS API error: {response.status}")
@@ -91,18 +117,15 @@ class SolarCalculator:
 
     def _calculate_fallback_production(self, peak_power: float) -> Dict[str, Any]:
         """Fallback calculation if PVGIS API fails"""
-        # Average yearly production in Germany: ~1000 kWh/kWp
         yearly_production = peak_power * 1000
         return {
             'yearly_production': yearly_production
         }
 
     def _calculate_financial_savings(self, yearly_production: float, consumption: float) -> Dict[str, float]:
-        # German electricity price assumptions (2023)
         electricity_price = 0.32  # €/kWh
         feed_in_tariff = 0.08    # €/kWh
         
-        # Calculate self-consumption and grid feed-in
         self_consumption = min(yearly_production, consumption)
         grid_feed_in = max(0, yearly_production - consumption)
         
@@ -113,10 +136,9 @@ class SolarCalculator:
         }
 
     def _calculate_environmental_impact(self, yearly_production: float) -> Dict[str, float]:
-        # CO2 emissions factor for German electricity mix (2023)
         co2_factor = 0.420  # kg CO2/kWh
         
         return {
-            'co2_savings': round(yearly_production * co2_factor, 2),  # kg CO2
-            'trees_equivalent': round((yearly_production * co2_factor) / 20, 1)  # One tree absorbs ~20kg CO2 per year
+            'co2_savings': round(yearly_production * co2_factor, 2),
+            'trees_equivalent': round((yearly_production * co2_factor) / 20, 1)
         }
