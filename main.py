@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 def validate_google_api():
     if not settings.google_cloud_api_key:
         logger.error("Google Cloud API Key nicht konfiguriert")
-        raise ValueError("Google Cloud API Key fehlt in .env")
+        raise ValueError("Google Cloud API Key fehlt in den Umgebungsvariablen")
     
     try:
         test_coordinates = requests.get(
@@ -36,8 +36,10 @@ def validate_google_api():
         logger.error(f"Google API Test fehlgeschlagen: {str(e)}")
         raise
 
-if not os.path.exists(".env"):
-    raise FileNotFoundError(".env Datei fehlt")
+# Prüfe auf .env Datei nur in der Entwicklungsumgebung
+if os.environ.get('ENVIRONMENT') != 'production':
+    if not os.path.exists(".env"):
+        raise FileNotFoundError("Lokale Entwicklung benötigt eine .env Datei")
 
 # Initialize FastAPI app
 app = FastAPI(
