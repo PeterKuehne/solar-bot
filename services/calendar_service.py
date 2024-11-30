@@ -23,6 +23,29 @@ class CalendarService:
             logger.error(f"Failed to initialize Calendar Service: {str(e)}")
             raise
 
+    def _validate_datetime(self, date_str: str, time_str: str) -> datetime:
+        try:
+            # Kombiniere Datum und Zeit
+            dt_str = f"{date_str}T{time_str}"
+            dt = datetime.fromisoformat(dt_str)
+            
+            # Stelle sicher, dass das Jahr nicht in der Vergangenheit liegt
+            current_year = datetime.now().year
+            if dt.year < current_year:
+                dt = dt.replace(year=current_year)
+                if dt < datetime.now():
+                    dt = dt.replace(year=current_year + 1)
+            
+            # Konvertiere in lokale Zeitzone
+            if dt.tzinfo is None:
+                dt = self.timezone.localize(dt)
+            else:
+                dt = dt.astimezone(self.timezone)
+                
+            return dt
+        except ValueError as e:
+            raise ValueError(f"Ungültiges Datum oder Zeit: {str(e)}")
+
     async def check_availability(self, start_time: datetime) -> Dict[str, Any]:
         """Check if a time slot is available"""
         logger.debug(f"Checking availability for time slot: {start_time}")
@@ -43,14 +66,22 @@ class CalendarService:
                     "message": "Termine sind nur von Montag bis Freitag möglich."
                 }
 
+            # Ensure timezone
+            if not start_time.tzinfo:
+                start_time = self.timezone.localize(start_time)
+
             end_time = start_time + timedelta(minutes=60)
             
-            # Query existing events
+            # Query existing events with buffer
+            buffer_start = start_time - timedelta(minutes=30)
+            buffer_end = end_time + timedelta(minutes=30)
+            
             events_result = self.service.events().list(
                 calendarId=self.calendar_id,
-                timeMin=start_time.isoformat(),
-                timeMax=end_time.isoformat(),
-                singleEvents=True
+                timeMin=buffer_start.isoformat(),
+                timeMax=buffer_end.isoformat(),
+                singleEvents=True,
+                orderBy='startTime'
             ).execute()
             
             events = events_result.get('items', [])
@@ -94,6 +125,8 @@ Agenda:
 - Wirtschaftlichkeitsberechnung
 - Fördermöglichkeiten
 - Nächste Schritte
+
+Hinweis: Sie können diesen Termin über den Link in der Bestätigungsmail verwalten, ändern oder stornieren.
 """
         return await self.create_event(
             date=datetime.isoformat(),
@@ -107,7 +140,7 @@ Agenda:
         email: str,
         description: str = None
     ) -> Dict[str, Any]:
-        """Book an appointment with thread-safe checking"""
+        """Book an appointment with availability check"""
         try:
             start_time = datetime.fromisoformat(date)
             if not start_time.tzinfo:
@@ -115,7 +148,7 @@ Agenda:
                 
             logger.debug(f"Attempting to book appointment for {email} at {start_time}")
 
-            # Check availability
+            # Check availability first
             availability = await self.check_availability(start_time)
             if not availability.get("available"):
                 logger.warning(f"Slot not available: {availability.get('message')}")
@@ -134,6 +167,8 @@ Agenda:
 - Individuelle Wirtschaftlichkeitsberechnung
 - Fördermöglichkeiten und Finanzierung
 - Konkrete nächste Schritte
+
+Hinweis: Sie können diesen Termin über den Link in der Bestätigungsmail verwalten, ändern oder stornieren.
 """,
                 'start': {
                     'dateTime': start_time.isoformat(),
@@ -203,7 +238,7 @@ Agenda:
             current_time = date_time
             while True:
                 availability = await self.check_availability(current_time)
-                if availability["available"]:
+                if availability.get("available"):
                     return current_time
                 current_time += timedelta(hours=1)  # Increment by 1 hour
         except Exception as e:

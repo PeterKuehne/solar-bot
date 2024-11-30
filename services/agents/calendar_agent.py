@@ -2,7 +2,11 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 import json
 import pytz
+import re
+import logging
 from .base_agent import BaseAgent
+
+logger = logging.getLogger(__name__)
 
 class CalendarAgent(BaseAgent):
     def __init__(self, openai_service, calendar_service):
@@ -14,20 +18,28 @@ class CalendarAgent(BaseAgent):
         self.APPOINTMENT_DURATION = 60  # Minuten
 
     def _get_system_prompt(self) -> str:
-        return """Du bist ein spezialisierter Terminplanungs-Agent für Solaranlagen-Beratungen.
+        return """Du bist ein Terminplanungs-Agent für Solaranlagen-Beratungen. 
         
-        Deine Hauptaufgaben sind:
-        1. Terminvereinbarungen koordinieren
-        2. Verfügbarkeit prüfen
-        3. Alternative Termine vorschlagen
-        4. Termine ändern oder stornieren
-
-        Wichtige Regeln:
-        - Termine nur Montag bis Freitag zwischen 9:00 und 17:00 Uhr
-        - Termine dauern standardmäßig 60 Minuten
-        - Bei technischen Fragen → Solar-Agent
-        - Immer E-Mail-Adresse für Bestätigung erfragen
-        - Termine bestätigen und Details per E-Mail senden"""
+        Terminregeln:
+        - Montag bis Freitag
+        - Zwischen 9:00 und 17:00 Uhr
+        - Dauer: 60 Minuten
+        
+        Erforderliche Daten:
+        - Name
+        - E-Mail-Adresse
+        - Optional: Telefonnummer
+        
+        Besonderheiten:
+        - Termin-Management erfolgt über Link in der Bestätigungsmail
+        - Informiere Kunden, dass sie über diesen Link Termine ändern oder stornieren können
+        - Bei technischen Fragen zur Solaranlage zum Solar-Agent weiterleiten
+        
+        Terminbestätigung soll nur enthalten:
+        - Datum und Uhrzeit des Termins
+        - Name des Kunden
+        - Hinweis auf die Bestätigungsmail mit dem Verwaltungslink
+        - Keine weiteren Verweise oder Hinweise"""
 
     def _get_functions(self) -> List[Dict[str, Any]]:
         return [
@@ -39,7 +51,7 @@ class CalendarAgent(BaseAgent):
                     "properties": {
                         "date": {
                             "type": "string",
-                            "description": "Gewünschtes Datum (ISO 8601)"
+                            "description": "Gewünschtes Datum (YYYY-MM-DD)"
                         },
                         "time": {
                             "type": "string",
@@ -57,7 +69,7 @@ class CalendarAgent(BaseAgent):
                     "properties": {
                         "date": {
                             "type": "string",
-                            "description": "Datum (ISO 8601)"
+                            "description": "Datum (YYYY-MM-DD)"
                         },
                         "time": {
                             "type": "string",
@@ -74,137 +86,107 @@ class CalendarAgent(BaseAgent):
                         "phone": {
                             "type": "string",
                             "description": "Telefonnummer (optional)"
-                        },
-                        "notes": {
-                            "type": "string",
-                            "description": "Zusätzliche Notizen"
                         }
                     },
                     "required": ["date", "time", "email", "name"]
                 }
             },
-            {
-                "name": "suggest_alternatives",
-                "description": "Schlägt alternative Termine vor",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "reference_date": {
-                            "type": "string",
-                            "description": "Referenzdatum (ISO 8601)"
-                        },
-                        "preferred_time": {
-                            "type": "string",
-                            "enum": ["morning", "afternoon", "any"],
-                            "description": "Bevorzugte Tageszeit"
-                        },
-                        "num_suggestions": {
-                            "type": "integer",
-                            "description": "Anzahl der Vorschläge",
-                            "default": 3
-                        }
-                    },
-                    "required": ["reference_date"]
-                }
-            },
-            {
-                "name": "modify_appointment",
-                "description": "Ändert einen bestehenden Termin",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "email": {
-                            "type": "string",
-                            "description": "E-Mail des Kunden"
-                        },
-                        "old_datetime": {
-                            "type": "string",
-                            "description": "Bisheriger Termin (ISO 8601)"
-                        },
-                        "new_datetime": {
-                            "type": "string",
-                            "description": "Neuer Termin (ISO 8601)"
-                        }
-                    },
-                    "required": ["email", "old_datetime", "new_datetime"]
-                }
-            },
-            {
-                "name": "cancel_appointment",
-                "description": "Storniert einen Termin",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "email": {
-                            "type": "string",
-                            "description": "E-Mail des Kunden"
-                        },
-                        "datetime": {
-                            "type": "string",
-                            "description": "Zu stornierenden Termin (ISO 8601)"
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Grund der Stornierung"
-                        }
-                    },
-                    "required": ["email", "datetime"]
-                }
-            },
-            # Handoff-Funktionen vom BaseAgent
             *self.get_handoff_functions()
         ]
 
-    def _validate_datetime(self, date_str: str, time_str: str) -> datetime:
-        """Validiert und kombiniert Datum und Zeit"""
-        try:
-            # Kombiniere Datum und Zeit
-            dt_str = f"{date_str}T{time_str}"
-            dt = datetime.fromisoformat(dt_str)
-            
-            # Konvertiere in lokale Zeitzone
-            if dt.tzinfo is None:
-                dt = self.timezone.localize(dt)
-            else:
-                dt = dt.astimezone(self.timezone)
-                
-            return dt
-        except ValueError as e:
-            raise ValueError(f"Ungültiges Datum oder Zeit: {str(e)}")
+    def _format_booking_confirmation(self, date: str, time: str, name: str, email: str) -> str:
+        dt = datetime.fromisoformat(date)
+        formatted_date = dt.strftime("%d. %B %Y")
+        return f"""Ihr Termin wurde erfolgreich gebucht!
 
-    def _is_business_hours(self, dt: datetime) -> bool:
-        """Prüft, ob der Zeitpunkt innerhalb der Geschäftszeiten liegt"""
-        return (
-            dt.weekday() < 5 and  # Montag-Freitag
-            self.BUSINESS_START <= dt.hour < self.BUSINESS_END
-        )
+Details:
+- Datum: {formatted_date}
+- Uhrzeit: {time} Uhr
+- Name: {name}
+
+Eine Bestätigungsmail wurde an {email} gesendet. 
+In der E-Mail finden Sie einen Link, über den Sie den Termin bei Bedarf ändern oder stornieren können."""
+
+    def _extract_date_time(self, message: str) -> Optional[Dict[str, str]]:
+        try:
+            # Suche nach Uhrzeiten
+            time_match = re.search(r'(\d{1,2}):(\d{2})', message)
+            if time_match:
+                hours, minutes = time_match.groups()
+                time = f"{int(hours):02d}:{minutes}"
+
+            # Suche nach Datum
+            date_patterns = [
+                r'(\d{1,2})\.?\s?(dezember|januar|februar|märz|april|mai|juni|juli|august|september|oktober|november)',
+                r'(\d{4})-(\d{2})-(\d{2})'
+            ]
+            
+            for pattern in date_patterns:
+                date_match = re.search(pattern, message.lower())
+                if date_match:
+                    if len(date_match.groups()) == 2:  # Format: Tag + Monat
+                        day, month = date_match.groups()
+                        month_map = {
+                            'januar': '01', 'februar': '02', 'märz': '03', 'april': '04',
+                            'mai': '05', 'juni': '06', 'juli': '07', 'august': '08',
+                            'september': '09', 'oktober': '10', 'november': '11', 'dezember': '12'
+                        }
+                        month_num = month_map[month]
+                        year = datetime.now().year
+                        if datetime.now().month > int(month_num):
+                            year += 1
+                        date = f"{year}-{month_num}-{int(day):02d}"
+                    else:  # Format: YYYY-MM-DD
+                        date = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
+                    
+                    return {"date": date, "time": time}
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting date/time: {str(e)}")
+            return None
+
+    def _extract_contact_info(self, conversation_history: List[Dict[str, str]]) -> Dict[str, str]:
+        """Extrahiert Kontaktinformationen aus der Konversationshistorie"""
+        contact_info = {}
+        for message in conversation_history:
+            content = message.get('content', '').lower()
+            if 'name:' in content:
+                name_match = re.search(r'name:\s*([^,\n]*)', content, re.I)
+                if name_match:
+                    contact_info['name'] = name_match.group(1).strip()
+            if 'email:' in content:
+                email_match = re.search(r'email:\s*([^,\n]*)', content, re.I)
+                if email_match:
+                    contact_info['email'] = email_match.group(1).strip()
+            if 'telefon:' in content or 'tel:' in content or 'phone:' in content:
+                phone_match = re.search(r'(?:telefon|tel|phone):\s*([^,\n]*)', content, re.I)
+                if phone_match:
+                    contact_info['phone'] = phone_match.group(1).strip()
+        return contact_info
 
     async def check_availability(self, date: str, time: str) -> Dict[str, Any]:
         """Prüft die Verfügbarkeit eines Termins"""
         try:
-            dt = self._validate_datetime(date, time)
+            # Stelle sicher, dass das Datum das richtige Jahr hat
+            if len(date.split('-')) == 3:
+                year = int(date.split('-')[0])
+                if year < datetime.now().year:
+                    date = f"{datetime.now().year}-{date.split('-')[1]}-{date.split('-')[2]}"
+                    if datetime.fromisoformat(f"{date}T{time}") < datetime.now():
+                        date = f"{datetime.now().year + 1}-{date.split('-')[1]}-{date.split('-')[2]}"
+
+            # Prüfe Verfügbarkeit
+            dt = self.calendar_service._validate_datetime(date, time)
+            availability = await self.calendar_service.check_availability(dt)
             
-            # Prüfe Geschäftszeiten
-            if not self._is_business_hours(dt):
-                return {
-                    "available": False,
-                    "reason": "Termin außerhalb der Geschäftszeiten (Mo-Fr 9:00-17:00)",
-                    "alternatives": await self.suggest_alternatives(date)
-                }
+            if not availability.get("available"):
+                # Hole alternative Termine
+                alternatives = await self.suggest_alternatives(date)
+                availability["alternatives"] = alternatives
 
-            # Prüfe Kalenderverfügbarkeit
-            is_available = await self.calendar_service.check_availability(dt)
-            if not is_available:
-                return {
-                    "available": False,
-                    "reason": "Termin bereits vergeben",
-                    "alternatives": await self.suggest_alternatives(date)
-                }
-
-            return {
-                "available": True,
-                "datetime": dt.isoformat()
-            }
+            return availability
 
         except Exception as e:
             return {
@@ -217,38 +199,33 @@ class CalendarAgent(BaseAgent):
                              time: str,
                              email: str,
                              name: str,
-                             phone: Optional[str] = None,
-                             notes: Optional[str] = None) -> Dict[str, Any]:
+                             phone: Optional[str] = None) -> Dict[str, Any]:
         """Bucht einen neuen Termin"""
         try:
-            # Prüfe Verfügbarkeit
-            availability = await self.check_availability(date, time)
-            if not availability.get("available"):
-                return availability
+            # Stelle sicher, dass das Datum das richtige Jahr hat
+            if len(date.split('-')) == 3:
+                year = int(date.split('-')[0])
+                if year < datetime.now().year:
+                    date = f"{datetime.now().year}-{date.split('-')[1]}-{date.split('-')[2]}"
+                    if datetime.fromisoformat(f"{date}T{time}") < datetime.now():
+                        date = f"{datetime.now().year + 1}-{date.split('-')[1]}-{date.split('-')[2]}"
 
-            dt = self._validate_datetime(date, time)
-            
-            # Buche Termin
+            # Validiere und buche den Termin
+            dt = self.calendar_service._validate_datetime(date, time)
             appointment = await self.calendar_service.create_appointment(
                 datetime=dt,
                 email=email,
                 name=name,
                 phone=phone,
-                notes=notes or "Solar-Beratungstermin",
-                duration=self.APPOINTMENT_DURATION
+                notes="Solar-Beratungstermin"
             )
 
-            return {
-                "success": True,
-                "appointment": {
-                    "datetime": dt.isoformat(),
-                    "name": name,
-                    "email": email,
-                    "phone": phone,
-                    "notes": notes,
-                    "confirmation_sent": True
+            if appointment.get('success'):
+                return {
+                    "success": True,
+                    "response": self._format_booking_confirmation(date, time, name, email)
                 }
-            }
+            return appointment
 
         except Exception as e:
             return {
@@ -256,118 +233,31 @@ class CalendarAgent(BaseAgent):
                 "error": str(e)
             }
 
-    async def suggest_alternatives(self, 
-                                 reference_date: str,
-                                 preferred_time: str = "any",
-                                 num_suggestions: int = 3) -> Dict[str, Any]:
-        """Schlägt alternative Termine vor"""
+    async def suggest_alternatives(self, reference_date: str) -> Dict[str, Any]:
         try:
-            ref_dt = datetime.fromisoformat(reference_date)
-            if ref_dt.tzinfo is None:
-                ref_dt = self.timezone.localize(ref_dt)
-            
-            suggestions = []
+            # Stelle sicher, dass das Datum das richtige Jahr hat
+            if len(reference_date.split('-')) == 3:
+                year = int(reference_date.split('-')[0])
+                if year < datetime.now().year:
+                    reference_date = f"{datetime.now().year}-{reference_date.split('-')[1]}-{reference_date.split('-')[2]}"
+                    dt = datetime.fromisoformat(reference_date)
+                    if dt < datetime.now():
+                        reference_date = f"{datetime.now().year + 1}-{reference_date.split('-')[1]}-{reference_date.split('-')[2]}"
+
+            # Finde alternative Termine
+            ref_dt = self.calendar_service._validate_datetime(reference_date, "09:00")
             current_dt = ref_dt
+            suggestions = []
             
-            # Definiere Zeitfenster basierend auf Präferenz
-            if preferred_time == "morning":
-                time_windows = [(self.BUSINESS_START, 12)]
-            elif preferred_time == "afternoon":
-                time_windows = [(13, self.BUSINESS_END)]
-            else:
-                time_windows = [(self.BUSINESS_START, 12), (13, self.BUSINESS_END)]
-
-            # Suche verfügbare Termine
-            while len(suggestions) < num_suggestions:
-                if self._is_business_hours(current_dt):
-                    for start_hour, end_hour in time_windows:
-                        if start_hour <= current_dt.hour < end_hour:
-                            is_available = await self.calendar_service.check_availability(current_dt)
-                            if is_available:
-                                suggestions.append(current_dt.isoformat())
-                                if len(suggestions) >= num_suggestions:
-                                    break
-                
+            for _ in range(3):  # 3 Alternative Termine finden
+                availability = await self.calendar_service.check_availability(current_dt)
+                if availability.get("available"):
+                    suggestions.append(current_dt.strftime("%Y-%m-%d %H:%M"))
                 current_dt += timedelta(hours=1)
-                if len(suggestions) < num_suggestions and current_dt.hour >= self.BUSINESS_END:
-                    current_dt = current_dt.replace(hour=self.BUSINESS_START) + timedelta(days=1)
-                    while current_dt.weekday() >= 5:  # Überspringe Wochenenden
-                        current_dt += timedelta(days=1)
 
             return {
                 "success": True,
-                "suggestions": suggestions
-            }
-
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-    async def modify_appointment(self,
-                               email: str,
-                               old_datetime: str,
-                               new_datetime: str) -> Dict[str, Any]:
-        """Ändert einen bestehenden Termin"""
-        try:
-            # Konvertiere Strings zu datetime
-            old_dt = datetime.fromisoformat(old_datetime)
-            new_dt = datetime.fromisoformat(new_datetime)
-            
-            # Prüfe Verfügbarkeit des neuen Termins
-            new_date = new_dt.strftime("%Y-%m-%d")
-            new_time = new_dt.strftime("%H:%M")
-            availability = await self.check_availability(new_date, new_time)
-            
-            if not availability.get("available"):
-                return availability
-
-            # Ändere Termin
-            updated = await self.calendar_service.modify_appointment(
-                email=email,
-                old_datetime=old_dt,
-                new_datetime=new_dt
-            )
-
-            return {
-                "success": True,
-                "appointment": {
-                    "old_datetime": old_dt.isoformat(),
-                    "new_datetime": new_dt.isoformat(),
-                    "email": email,
-                    "confirmation_sent": True
-                }
-            }
-
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-    async def cancel_appointment(self,
-                               email: str,
-                               datetime: str,
-                               reason: Optional[str] = None) -> Dict[str, Any]:
-        """Storniert einen Termin"""
-        try:
-            dt = datetime.fromisoformat(datetime)
-            
-            cancelled = await self.calendar_service.cancel_appointment(
-                email=email,
-                datetime=dt,
-                reason=reason
-            )
-
-            return {
-                "success": True,
-                "cancelled": {
-                    "datetime": dt.isoformat(),
-                    "email": email,
-                    "reason": reason,
-                    "confirmation_sent": True
-                }
+                "alternatives": suggestions
             }
 
         except Exception as e:

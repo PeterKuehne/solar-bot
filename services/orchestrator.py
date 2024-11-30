@@ -3,48 +3,63 @@ import logging
 import json
 import pytz
 from datetime import datetime
+import re
 from .agents.solar_agent import SolarAgent
 from .agents.calendar_agent import CalendarAgent
 
 logger = logging.getLogger(__name__)
 
 class Orchestrator:
-    """
-    Koordiniert die Kommunikation zwischen den spezialisierten Agenten.
-    Verwaltet Handoffs und Kontextübergaben zwischen den Agenten.
-    """
-    
     def __init__(self, openai_service, solar_calculator, calendar_service):
         self.timezone = pytz.timezone('Europe/Berlin')
-        
-        # Initialisiere die spezialisierten Agenten
         self.agents = {
             "solar_agent": SolarAgent(openai_service, solar_calculator),
             "calendar_agent": CalendarAgent(openai_service, calendar_service)
         }
-        
-        # Speichert Konversationshistorien
-        self.conversations: Dict[str, List[Dict[str, str]]] = {}
-        
-        # Tracking für Handoffs
-        self.current_agent: Dict[str, str] = {}
-        self.handoff_history: Dict[str, List[Dict[str, Any]]] = {}
-        
-        # Maximale Anzahl von Handoffs pro Konversation
+        self.conversations = {}  # user_id -> conversation_history
+        self.current_agent = {}  # user_id -> current_agent
+        self.handoff_history = {}  # user_id -> handoff_history
+        self.context = {}       # user_id -> last_context
         self.max_handoffs = 5
 
+        self.calendar_keywords = [
+            r'\btermin\b', r'\bbuchen\b', r'\bkalender\b', r'\bberatung\b',
+            r'\btreffen\b', r'\buhr\b', r'\bdezember\b', r'\bjanuar\b',
+            r'\bfebruar\b', r'\bmärz\b', r'\bapril\b', r'\bmai\b', r'\bjuni\b',
+            r'\bjuli\b', r'\baugust\b', r'\bseptember\b', r'\boktober\b',
+            r'\bnovember\b', r'\b9:00\b', r'\b10:00\b', r'\b11:00\b'
+        ]
+
+    def _detect_initial_agent(self, message: str) -> str:
+        """Erkennt den passenden Agenten basierend auf der Nachricht"""
+        message_lower = message.lower()
+        
+        # Prüfe auf Kalender-Schlüsselwörter
+        for keyword in self.calendar_keywords:
+            if re.search(keyword, message_lower):
+                return "calendar_agent"
+        
+        return "solar_agent"
+
     def _get_conversation_history(self, user_id: str = "default") -> List[Dict[str, str]]:
-        """Holt oder erstellt eine neue Konversationshistorie"""
         if user_id not in self.conversations:
             self.conversations[user_id] = []
         return self.conversations[user_id]
 
-    def _get_current_agent(self, user_id: str = "default") -> str:
-        """Ermittelt den aktuell zuständigen Agenten"""
-        return self.current_agent.get(user_id, "solar_agent")
+    def _get_current_agent(self, user_id: str = "default", message: str = "") -> str:
+        if user_id not in self.current_agent:
+            self.current_agent[user_id] = self._detect_initial_agent(message)
+        return self.current_agent[user_id]
+
+    def _save_context(self, user_id: str, context: Dict):
+        """Speichert Kontext für einen Benutzer"""
+        self.context[user_id] = context
+
+    def _get_context(self, user_id: str) -> Optional[Dict]:
+        """Holt den gespeicherten Kontext eines Benutzers"""
+        return self.context.get(user_id)
 
     def _record_handoff(self, user_id: str, from_agent: str, to_agent: str, reason: str):
-        """Dokumentiert einen Handoff zwischen Agenten"""
         if user_id not in self.handoff_history:
             self.handoff_history[user_id] = []
         
@@ -55,82 +70,115 @@ class Orchestrator:
             "reason": reason
         })
 
+    async def _handle_handoff(self, response: Dict[str, Any], user_id: str, 
+                            current_agent_id: str, conversation_history: List[Dict[str, str]]) -> Dict[str, Any]:
+        if len(self.handoff_history.get(user_id, [])) >= self.max_handoffs:
+            logger.warning(f"Maximale Handoff-Anzahl erreicht für User {user_id}")
+            return {
+                "type": "error",
+                "content": "Zu viele Agentenübergaben. Bitte starten Sie eine neue Anfrage."
+            }
+        
+        new_agent_id = response["target_agent"]
+        if new_agent_id not in self.agents:
+            logger.error(f"Unbekannter Zielagent: {new_agent_id}")
+            return {
+                "type": "error",
+                "content": "Interner Fehler bei der Agentenübergabe."
+            }
+        
+        reason = response.get("reason", "Nicht spezifiziert")
+        self._record_handoff(
+            user_id=user_id,
+            from_agent=current_agent_id,
+            to_agent=new_agent_id,
+            reason=reason
+        )
+        
+        self.current_agent[user_id] = new_agent_id
+        
+        return {
+            "type": "message",
+            "content": f"Übergabe an {new_agent_id} wegen: {reason}",
+            "agent": new_agent_id
+        }
+
+    def _extract_contact_info(self, message: str) -> Dict[str, str]:
+        """Extrahiert Kontaktinformationen aus einer Nachricht"""
+        contact_info = {}
+        
+        # Name extrahieren
+        name_match = re.search(r'name:?\s*([^,\n]*)', message, re.I)
+        if name_match:
+            contact_info['name'] = name_match.group(1).strip()
+            
+        # Email extrahieren
+        email_match = re.search(r'email:?\s*([^,\n]*)', message, re.I)
+        if email_match:
+            contact_info['email'] = email_match.group(1).strip()
+            
+        # Telefon extrahieren
+        phone_match = re.search(r'(?:telefon|tel|phone):?\s*([^,\n]*)', message, re.I)
+        if phone_match:
+            contact_info['phone'] = phone_match.group(1).strip()
+            
+        return contact_info
+
     async def process_message(self, message: str, context: Optional[Dict] = None, 
                             user_id: str = "default") -> Dict[str, Any]:
-        """
-        Verarbeitet eine Nachricht und koordiniert mögliche Handoffs zwischen Agenten.
-        
-        Args:
-            message: Die Nutzernachricht
-            context: Optionaler Kontext für die Verarbeitung
-            user_id: Identifier für den Nutzer
-            
-        Returns:
-            Dict mit der Antwort und möglichen Handoff-Informationen
-        """
         try:
-            # Hole oder erstelle Konversationshistorie
             conversation_history = self._get_conversation_history(user_id)
+            stored_context = self._get_context(user_id) or {}
             
-            # Füge Nutzernachricht zur Historie hinzu
+            # Extrahiere Kontaktinformationen aus der Nachricht
+            contact_info = self._extract_contact_info(message)
+            if contact_info:
+                stored_context.update(contact_info)
+                self._save_context(user_id, stored_context)
+            
             conversation_history.append({
                 "role": "user",
                 "content": message
             })
             
-            # Hole aktuellen Agenten
-            current_agent_id = self._get_current_agent(user_id)
+            current_agent_id = self._get_current_agent(user_id, message)
             current_agent = self.agents[current_agent_id]
             
-            # Verarbeite die Nachricht mit dem aktuellen Agenten
+            # Füge gespeicherten Kontext zum aktuellen Kontext hinzu
+            if context:
+                context.update(stored_context)
+            else:
+                context = stored_context
+            
             response = await current_agent.process(
                 message=message,
                 conversation_history=conversation_history
             )
             
-            # Prüfe auf Handoff-Anfrage
             if response["type"] == "handoff":
-                # Prüfe maximale Handoff-Anzahl
-                if len(self.handoff_history.get(user_id, [])) >= self.max_handoffs:
-                    logger.warning(f"Maximale Handoff-Anzahl erreicht für User {user_id}")
-                    return {
-                        "type": "error",
-                        "content": "Zu viele Agentenübergaben. Bitte starten Sie eine neue Anfrage."
-                    }
-                
-                # Führe Handoff durch
-                new_agent_id = response["target_agent"]
-                if new_agent_id not in self.agents:
-                    logger.error(f"Unbekannter Zielagent: {new_agent_id}")
-                    return {
-                        "type": "error",
-                        "content": "Interner Fehler bei der Agentenübergabe."
-                    }
-                
-                # Dokumentiere Handoff
-                self._record_handoff(
-                    user_id=user_id,
-                    from_agent=current_agent_id,
-                    to_agent=new_agent_id,
-                    reason=response.get("reason", "Nicht spezifiziert")
+                handoff_response = await self._handle_handoff(
+                    response, user_id, current_agent_id, conversation_history
                 )
                 
-                # Aktualisiere aktuellen Agenten
-                self.current_agent[user_id] = new_agent_id
-                
-                # Füge Handoff-Information zur Konversationshistorie hinzu
                 conversation_history.append({
                     "role": "system",
-                    "content": f"Übergabe an {new_agent_id} wegen: {response.get('reason')}"
+                    "content": handoff_response["content"]
                 })
                 
-                # Verarbeite mit neuem Agenten
-                return await self.agents[new_agent_id].process(
+                new_agent = self.agents[handoff_response["agent"]]
+                new_response = await new_agent.process(
                     message=message,
                     conversation_history=conversation_history
                 )
+                
+                conversation_history.append({
+                    "role": "assistant",
+                    "content": new_response.get("content", ""),
+                    "agent": handoff_response["agent"]
+                })
+                
+                return new_response
             
-            # Normale Antwort
             conversation_history.append({
                 "role": "assistant",
                 "content": response.get("content", ""),
@@ -152,16 +200,16 @@ class Orchestrator:
             }
 
     def get_conversation_summary(self, user_id: str = "default") -> Dict[str, Any]:
-        """Erstellt eine Zusammenfassung der Konversation mit Handoff-Historie"""
         return {
             "conversation_length": len(self.conversations.get(user_id, [])),
             "current_agent": self._get_current_agent(user_id),
             "handoff_count": len(self.handoff_history.get(user_id, [])),
-            "handoff_history": self.handoff_history.get(user_id, [])
+            "handoff_history": self.handoff_history.get(user_id, []),
+            "context": self._get_context(user_id)
         }
 
     def reset_conversation(self, user_id: str = "default"):
-        """Setzt die Konversation zurück"""
         self.conversations[user_id] = []
         self.current_agent[user_id] = "solar_agent"
         self.handoff_history[user_id] = []
+        self.context[user_id] = {}
