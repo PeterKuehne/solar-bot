@@ -13,12 +13,12 @@ class CalendarAgent(BaseAgent):
         super().__init__("calendar_agent", openai_service)
         self.calendar_service = calendar_service
         self.timezone = pytz.timezone('Europe/Berlin')
-        self.BUSINESS_START = 9  # 9:00
-        self.BUSINESS_END = 17   # 17:00
-        self.APPOINTMENT_DURATION = 60  # Minuten
+        self.BUSINESS_START = 9
+        self.BUSINESS_END = 17
+        self.APPOINTMENT_DURATION = 60
 
     def _get_system_prompt(self) -> str:
-        return """Du bist ein Terminplanungs-Agent für Solaranlagen-Beratungen. 
+        return """Du bist ein Terminplanungs-Agent für Solaranlagen-Beratungen. Du verstehst natürliche Zeitangaben wie "nächster Dienstag" oder "morgen" und wandelst diese in konkrete Termine um.
         
         Terminregeln:
         - Montag bis Freitag
@@ -33,30 +33,32 @@ class CalendarAgent(BaseAgent):
         Besonderheiten:
         - Termin-Management erfolgt über Link in der Bestätigungsmail
         - Informiere Kunden, dass sie über diesen Link Termine ändern oder stornieren können
-        - Bei technischen Fragen zur Solaranlage zum Solar-Agent weiterleiten
-        
-        Terminbestätigung soll nur enthalten:
-        - Datum und Uhrzeit des Termins
-        - Name des Kunden
-        - Hinweis auf die Bestätigungsmail mit dem Verwaltungslink
-        - Keine weiteren Verweise oder Hinweise"""
+        - Bei technischen Fragen zur Solaranlage zum Solar-Agent weiterleiten"""
 
     def _get_functions(self) -> List[Dict[str, Any]]:
         return [
+            {
+                "name": "parse_relative_date",
+                "description": "Wandelt relative Zeitangaben in konkrete Daten um",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "Die zu analysierende Zeitangabe (z.B. 'nächster Dienstag 9:00')"
+                        }
+                    },
+                    "required": ["text"]
+                }
+            },
             {
                 "name": "check_availability",
                 "description": "Prüft die Verfügbarkeit eines Termins",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "date": {
-                            "type": "string",
-                            "description": "Gewünschtes Datum (YYYY-MM-DD)"
-                        },
-                        "time": {
-                            "type": "string",
-                            "description": "Gewünschte Uhrzeit (HH:MM)"
-                        }
+                        "date": {"type": "string", "description": "Datum (YYYY-MM-DD)"},
+                        "time": {"type": "string", "description": "Uhrzeit (HH:MM)"}
                     },
                     "required": ["date", "time"]
                 }
@@ -67,32 +69,59 @@ class CalendarAgent(BaseAgent):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "date": {
-                            "type": "string",
-                            "description": "Datum (YYYY-MM-DD)"
-                        },
-                        "time": {
-                            "type": "string",
-                            "description": "Uhrzeit (HH:MM)"
-                        },
-                        "email": {
-                            "type": "string",
-                            "description": "E-Mail-Adresse für Bestätigung"
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Name des Kunden"
-                        },
-                        "phone": {
-                            "type": "string",
-                            "description": "Telefonnummer (optional)"
-                        }
+                        "date": {"type": "string", "description": "Datum (YYYY-MM-DD)"},
+                        "time": {"type": "string", "description": "Uhrzeit (HH:MM)"},
+                        "email": {"type": "string", "description": "E-Mail-Adresse"},
+                        "name": {"type": "string", "description": "Name des Kunden"},
+                        "phone": {"type": "string", "description": "Telefonnummer (optional)"}
                     },
                     "required": ["date", "time", "email", "name"]
                 }
             },
             *self.get_handoff_functions()
         ]
+
+    async def parse_relative_date(self, text: str) -> Dict[str, Any]:
+        """Wandelt relative Zeitangaben in konkrete Daten um"""
+        try:
+            # OpenAI aufrufen für die Interpretation der Zeitangabe
+            prompt = f"""
+            Wandle die folgende Zeitangabe in ein konkretes Datum um. 
+            Zeitangabe: "{text}"
+            Aktuelles Datum: {datetime.now(self.timezone).strftime('%Y-%m-%d')}
+            
+            Antworte nur mit dem Datum im Format YYYY-MM-DD und der Uhrzeit im Format HH:MM, 
+            getrennt durch ein Leerzeichen. Beispiel: "2024-02-20 09:00"
+            """
+            
+            response = await self.openai_service.chat_completion([
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text}
+            ])
+            
+            # Antwort parsen
+            date_time_str = response['content'].strip()
+            date_str, time_str = date_time_str.split()
+            
+            # Validieren
+            parsed_date = datetime.strptime(date_str, '%Y-%m-%d')
+            parsed_time = datetime.strptime(time_str, '%H:%M').time()
+            
+            # Prüfen ob das Datum in der Vergangenheit liegt
+            if parsed_date.date() < datetime.now().date():
+                raise ValueError("Das Datum liegt in der Vergangenheit")
+            
+            return {
+                "success": True,
+                "date": date_str,
+                "time": time_str
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e)
+            }
 
     def _format_booking_confirmation(self, date: str, time: str, name: str, email: str) -> str:
         dt = datetime.fromisoformat(date)
@@ -106,46 +135,6 @@ Details:
 
 Eine Bestätigungsmail wurde an {email} gesendet. 
 In der E-Mail finden Sie einen Link, über den Sie den Termin bei Bedarf ändern oder stornieren können."""
-
-    def _extract_date_time(self, message: str) -> Optional[Dict[str, str]]:
-        try:
-            # Suche nach Uhrzeiten
-            time_match = re.search(r'(\d{1,2}):(\d{2})', message)
-            if time_match:
-                hours, minutes = time_match.groups()
-                time = f"{int(hours):02d}:{minutes}"
-
-            # Suche nach Datum
-            date_patterns = [
-                r'(\d{1,2})\.?\s?(dezember|januar|februar|märz|april|mai|juni|juli|august|september|oktober|november)',
-                r'(\d{4})-(\d{2})-(\d{2})'
-            ]
-            
-            for pattern in date_patterns:
-                date_match = re.search(pattern, message.lower())
-                if date_match:
-                    if len(date_match.groups()) == 2:  # Format: Tag + Monat
-                        day, month = date_match.groups()
-                        month_map = {
-                            'januar': '01', 'februar': '02', 'märz': '03', 'april': '04',
-                            'mai': '05', 'juni': '06', 'juli': '07', 'august': '08',
-                            'september': '09', 'oktober': '10', 'november': '11', 'dezember': '12'
-                        }
-                        month_num = month_map[month]
-                        year = datetime.now().year
-                        if datetime.now().month > int(month_num):
-                            year += 1
-                        date = f"{year}-{month_num}-{int(day):02d}"
-                    else:  # Format: YYYY-MM-DD
-                        date = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
-                    
-                    return {"date": date, "time": time}
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error extracting date/time: {str(e)}")
-            return None
 
     def _extract_contact_info(self, conversation_history: List[Dict[str, str]]) -> Dict[str, str]:
         """Extrahiert Kontaktinformationen aus der Konversationshistorie"""
@@ -231,6 +220,55 @@ In der E-Mail finden Sie einen Link, über den Sie den Termin bei Bedarf ändern
             return {
                 "success": False,
                 "error": str(e)
+            }
+
+    async def process_message(self, message: str, conversation_history: List[Dict[str, str]]) -> Dict[str, Any]:
+        try:
+            # Erst prüfen ob es eine Zeitangabe ist
+            if any(keyword in message.lower() for keyword in ['termin', 'uhr', 'zeit', 'morgen', 'nächste']):
+                # Relative Zeitangabe parsen
+                date_time = await self.parse_relative_date(message)
+                
+                if date_time["success"]:
+                    # Verfügbarkeit prüfen
+                    availability = await self.check_availability(
+                        date=date_time["date"],
+                        time=date_time["time"]
+                    )
+                    
+                    if availability.get("available"):
+                        # Kontaktinformationen extrahieren
+                        contact_info = self._extract_contact_info(conversation_history)
+                        
+                        if contact_info.get("email") and contact_info.get("name"):
+                            # Termin buchen
+                            booking = await self.book_appointment(
+                                date=date_time["date"],
+                                time=date_time["time"],
+                                email=contact_info["email"],
+                                name=contact_info["name"],
+                                phone=contact_info.get("phone")
+                            )
+                            return booking
+                        else:
+                            return {
+                                "type": "query",
+                                "content": "Bitte teilen Sie mir Ihren Namen, Ihre E-Mail-Adresse und optional Ihre Telefonnummer mit."
+                            }
+                    else:
+                        return {
+                            "type": "message",
+                            "content": f"Der gewünschte Termin ist leider nicht verfügbar. {availability.get('message', '')}"
+                        }
+            
+            # Standardverarbeitung für andere Nachrichten
+            return await super().process_message(message, conversation_history)
+            
+        except Exception as e:
+            logger.error(f"Error in calendar agent: {str(e)}")
+            return {
+                "type": "error",
+                "content": f"Ein Fehler ist aufgetreten: {str(e)}"
             }
 
     async def suggest_alternatives(self, reference_date: str) -> Dict[str, Any]:
